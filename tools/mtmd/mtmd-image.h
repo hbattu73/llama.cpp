@@ -61,6 +61,12 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
     mtmd_image_preprocessor_llava_uhd(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 
+    // When true (Granite4 Vision / LLaVA-Next anyres), always emit high-res
+    // slices for pinpoint models even when the image fits a single tile, so the
+    // grid matches HF get_anyres_image_grid_shape (e.g. a 1x1 grid still yields
+    // one tile). Default false preserves existing llava-uhd behavior.
+    bool always_slice_with_pinpoints = false;
+
     struct slice_coordinates {
         int x;
         int y;
@@ -221,6 +227,8 @@ struct mtmd_image_preprocessor_youtuvl : mtmd_image_preprocessor {
 
 // similar to llava_uhd, but has add_newline
 struct mtmd_image_preprocessor_granite : mtmd_image_preprocessor_llava_uhd {
-    mtmd_image_preprocessor_granite(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
+    mtmd_image_preprocessor_granite(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {
+        always_slice_with_pinpoints = true;
+    }
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };

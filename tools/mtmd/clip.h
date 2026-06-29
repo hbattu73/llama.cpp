@@ -80,6 +80,11 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img);
 // this should be equal to the embedding dimension of the text model
 int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 
+// Granite4 Vision: the per-token image_newline embedding row (size = clip_n_mmproj_embd),
+// i.e. the learned newline vector tiled across the deepstack projector blocks.
+// Used by the host-side multi-tile reassembly in mtmd.cpp.
+bool clip_granite4_newline_row(struct clip_ctx * ctx, std::vector<float> & out);
+
 // TODO: remove clip_image_encode() and always use batched version
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);

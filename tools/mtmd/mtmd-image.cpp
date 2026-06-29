@@ -628,7 +628,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_llava_uhd::preprocess(const clip_
 mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_llava_uhd::get_slice_instructions(const clip_image_size & original_size) {
     mtmd_image_preprocessor_llava_uhd::slice_instructions res;
     // align slices by patch_size * n_merge so an integer number of merger output tokens fits per slice
-    const int n_merge         = hparams.n_merge;
+    const int n_merge         = hparams.n_merge > 0 ? hparams.n_merge : 1;
     const int patch_size      = hparams.patch_size * n_merge;
     const int slice_size      = hparams.image_size;
     const int original_width  = original_size.width;
@@ -637,7 +637,11 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_ll
     const bool has_slices    = original_size.width > slice_size || original_size.height > slice_size;
     const bool has_pinpoints = !hparams.image_res_candidates.empty();
 
-    if (!has_slices) {
+    // Granite4 Vision (anyres) always slices via pinpoints, even for small images,
+    // so the grid matches HF get_anyres_image_grid_shape (a 1x1 grid -> one tile).
+    const bool force_slice = has_pinpoints && always_slice_with_pinpoints;
+
+    if (!has_slices && !force_slice) {
         // skip slicing logic
         res.overview_size = clip_image_size{slice_size, slice_size};
         res.refined_size  = clip_image_size{0, 0};
@@ -894,7 +898,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     clip_image_u8 resized_image;
     const clip_image_size original_size = img.get_size();
     // the original pixtral model doesn't have n_merge
-    const int cur_merge = hparams.n_merge;
+    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
     const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
         original_size,
         hparams.patch_size * cur_merge,
@@ -1547,13 +1551,16 @@ mtmd_image_preproc_out mtmd_image_preprocessor_youtuvl::preprocess(const clip_im
 mtmd_image_preproc_out mtmd_image_preprocessor_granite::preprocess(const clip_image_u8 & img) {
     auto output = mtmd_image_preprocessor_llava_uhd::preprocess(img);
     if (output.entries.size() == 0) {
-        // Single-tile (overview only): append one newline row.
+        // True single-tile (overview only): append one newline row in-graph.
+        // (With anyres pinpoints this is rare; small images still get a 1x1 tile.)
         output.overview.add_newline = true;
     } else {
-        // Multi-tile: overview gets no newline, grid tiles get one.
+        // Multi-tile: newlines are added by the host-side reassembly
+        // (granite4_reassemble), one per spatial row, so the per-tile graph
+        // must NOT append its own. Overview also has no newline.
         output.overview.add_newline = false;
         for (size_t i = 0; i < output.entries.size(); ++i) {
-            output.entries[i].add_newline = true;
+            output.entries[i].add_newline = false;
         }
     }
     return output;

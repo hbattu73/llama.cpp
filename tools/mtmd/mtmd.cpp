@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,7 +92,18 @@ struct mtmd_image_tokens {
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
     uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
     uint32_t n_temporal_merge = 1; // for qwen-vl style temporal merge
+
+    // Granite4 Vision multi-tile: the tiles in batch_f32 ([overview, tiles...]) are
+    // reassembled host-side (interleave + unpad + per-row newline) at encode time.
+    bool     g4v_reassemble = false;
+    uint32_t g4v_grid_x = 0, g4v_grid_y = 0; // tiles per row / per column
+    uint32_t g4v_orig_w = 0, g4v_orig_h = 0; // original image size (for unpad)
+    uint32_t g4v_n_tokens = 0;               // precomputed reassembled token count
+
     uint32_t n_tokens() const {
+        if (g4v_reassemble) {
+            return g4v_n_tokens;
+        }
         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
             return (nx + 1) * ny + 2;
@@ -132,12 +144,26 @@ struct mtmd_image_tokens {
             pos,
             image_idx,
             n_temporal_merge,
+            g4v_reassemble,
+            g4v_grid_x,
+            g4v_grid_y,
+            g4v_orig_w,
+            g4v_orig_h,
+            g4v_n_tokens,
             batch_f32.clone(),
             id
         };
     }
 };
 using mtmd_image_tokens_ptr = std::unique_ptr<mtmd_image_tokens>;
+
+// Granite4 Vision multi-tile reassembly helpers (defined below, near mtmd_encode_impl).
+static uint32_t granite4_count_tokens(int s, int grid_y, int grid_x, int orig_h, int orig_w);
+static void     granite4_reassemble(
+        const std::vector<std::vector<float>> & entries,
+        int s, int grid_y, int grid_x, int orig_h, int orig_w,
+        const std::vector<float> & newline_row, int n_embd,
+        std::vector<float> & out);
 
 struct mtmd_audio_tokens {
     uint32_t n_tokens = 0; // number of tokens
@@ -1106,7 +1132,56 @@ struct mtmd_tokenizer {
             const bool has_tiling_grid = (preproc_out.grid_x > 0 && preproc_out.grid_y > 0)
                 || preproc_out.has_overview();
 
-            if (has_tiling_grid) {
+            // Granite4 Vision (LLaVA-Next anyres): emit the overview + all tiles as a
+            // single image chunk, reassembled host-side at encode time (interleave +
+            // unpad + per-row newline). See mtmd_encode_impl / granite4_reassemble.
+            const bool is_granite4_multitile =
+                ctx->proj_type_v() == PROJECTOR_TYPE_GRANITE4_VISION
+                && !preproc_out.entries.empty();
+
+            if (is_granite4_multitile) {
+                GGML_ASSERT(bitmaps.size() == 1);
+                GGML_ASSERT(preproc_out.has_overview());
+
+                const int grid_x = preproc_out.grid_x;
+                const int grid_y = preproc_out.grid_y;
+                GGML_ASSERT(grid_x > 0 && grid_y > 0);
+                GGML_ASSERT((int) preproc_out.entries.size() == grid_x * grid_y);
+
+                // per-tile side s = sqrt(per-tile token count) (e.g. 144 -> 12)
+                const int per_tile = clip_n_output_tokens(ctx->ctx_v, &preproc_out.entries[0]);
+                const int s = (int) std::lround(std::sqrt((double) per_tile));
+                GGML_ASSERT(s * s == per_tile && "granite4 tile is not square");
+
+                mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                image_tokens->g4v_reassemble = true;
+                image_tokens->g4v_grid_x   = (uint32_t) grid_x;
+                image_tokens->g4v_grid_y   = (uint32_t) grid_y;
+                image_tokens->g4v_orig_w   = (uint32_t) bitmaps[0]->nx;
+                image_tokens->g4v_orig_h   = (uint32_t) bitmaps[0]->ny;
+                image_tokens->g4v_n_tokens = granite4_count_tokens(
+                    s, grid_y, grid_x, (int) bitmaps[0]->ny, (int) bitmaps[0]->nx);
+                image_tokens->pos = ctx->pos_type;
+                image_tokens->id  = bitmaps[0]->id;
+
+                // batch_f32 = [overview, tile(0,0), tile(0,1), ...] (overview first)
+                clip_image_f32_batch batch_f32;
+                batch_f32.is_audio = false;
+                batch_f32.entries.emplace_back(std::move(preproc_out.overview));
+                for (auto & e : preproc_out.entries) {
+                    batch_f32.entries.emplace_back(std::move(e));
+                }
+                image_tokens->batch_f32 = std::move(batch_f32);
+
+                mtmd_input_chunk chunk{
+                    MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                    {}, // text tokens
+                    std::move(image_tokens),
+                    nullptr, // audio tokens
+                };
+                cur.entries.emplace_back(std::move(chunk));
+
+            } else if (has_tiling_grid) {
                 // [QWEN_VIDEO] we do not support "frame merging" for llama-uhd style, so no batching for now
                 GGML_ASSERT(bitmaps.size() == 1);
 
@@ -1439,6 +1514,72 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
     }
 }
 
+// --- Granite4 Vision multi-tile reassembly (LLaVA-Next anyres) ---------------
+// Mirrors granite4_vision.py::_pack_and_unpad_image_features: tiles are
+// reassembled into one spatial grid, cropped (unpad) back to the original
+// aspect ratio, then one image_newline row is appended per spatial row; the
+// overview is prepended with no newline.
+
+// HF unpad_image: crop the reassembled (cur_h x cur_w) feature grid to the
+// original aspect ratio, centered.
+static void granite4_unpad_hw(int cur_h, int cur_w, int orig_h, int orig_w, int & h, int & w) {
+    const double orig_aspect = (double) orig_w / orig_h;
+    const double cur_aspect  = (double) cur_w / cur_h;
+    if (orig_aspect > cur_aspect) {        // original is wider -> crop rows
+        const double scale = (double) cur_w / orig_w;
+        h = (int) std::lround(orig_h * scale);
+        w = cur_w;
+    } else {                               // original is taller -> crop cols
+        const double scale = (double) cur_h / orig_h;
+        h = cur_h;
+        w = (int) std::lround(orig_w * scale);
+    }
+}
+
+// Number of LLM tokens an image occupies after reassembly:
+// overview (s*s, no newline) + unpadded grid rows, each (w + 1 newline).
+static uint32_t granite4_count_tokens(int s, int grid_y, int grid_x, int orig_h, int orig_w) {
+    int h, w;
+    granite4_unpad_hw(grid_y * s, grid_x * s, orig_h, orig_w, h, w);
+    return (uint32_t) (s * s + h * (w + 1));
+}
+
+// entries: [overview, tile(0,0), tile(0,1), ... tile(grid_y-1,grid_x-1)] in
+// row-major order, each (s*s) rows of n_embd floats (token-major). Produces the
+// final image embedding sequence in out (cleared first).
+static void granite4_reassemble(
+        const std::vector<std::vector<float>> & entries,
+        int s, int grid_y, int grid_x, int orig_h, int orig_w,
+        const std::vector<float> & newline_row, int n_embd,
+        std::vector<float> & out) {
+    const int cur_h = grid_y * s, cur_w = grid_x * s;
+    int h, w;
+    granite4_unpad_hw(cur_h, cur_w, orig_h, orig_w, h, w);
+    const int row_off = (cur_h - h) / 2; // centered crop
+    const int col_off = (cur_w - w) / 2;
+
+    out.clear();
+    out.reserve((size_t) (s * s + h * (w + 1)) * n_embd);
+    auto push_row = [&](const float * src) { out.insert(out.end(), src, src + n_embd); };
+
+    // overview first, no newline
+    const std::vector<float> & ov = entries[0];
+    for (int i = 0; i < s * s; ++i) {
+        push_row(&ov[(size_t) i * n_embd]);
+    }
+    // interleaved + unpadded tile rows, one newline per spatial row
+    for (int rr = 0; rr < h; ++rr) {
+        const int gr = (rr + row_off) / s, lr = (rr + row_off) % s;
+        for (int cc = 0; cc < w; ++cc) {
+            const int gc = (cc + col_off) / s, lc = (cc + col_off) % s;
+            const int tile  = 1 + gr * grid_x + gc; // +1: skip overview
+            const int local = lr * s + lc;
+            push_row(&entries[tile][(size_t) local * n_embd]);
+        }
+        push_row(newline_row.data());
+    }
+}
+
 static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
@@ -1453,6 +1594,53 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
     if (image_tokens->is_placeholder()) {
         LOG_ERR("%s: image tokens batch is placeholder\n", __func__);
         return 1;
+    }
+
+    if (image_tokens->g4v_reassemble) {
+        // Granite4 Vision: encode overview + each tile separately (the graph is
+        // per-tile), then reassemble host-side to match the reference layout.
+        const auto & batch = image_tokens->batch_f32.entries; // [overview, tiles...]
+        const int n_entries = (int) batch.size();
+        GGML_ASSERT(n_entries >= 2);
+
+        std::vector<std::vector<float>> enc(n_entries);
+        int s = 0;
+        for (int e = 0; e < n_entries; ++e) {
+            clip_image_f32_batch one;
+            one.is_audio = false;
+            one.entries.emplace_back(batch[e]); // copy single tile
+
+            // clip_image_batch_encode copies into a pre-sized buffer (it skips the
+            // copy if empty), so size it to (per-tile tokens) * n_embd first.
+            const int per_tile = clip_n_output_tokens(ctx_clip, &batch[e]);
+            enc[e].resize((size_t) per_tile * n_embd_out);
+
+            if (!clip_image_batch_encode(ctx_clip, ctx->n_threads, &one, enc[e])) {
+                return 1;
+            }
+            // per-tile token count is s*s; derive the tile side s once
+            const int rows = (int) (enc[e].size() / n_embd_out);
+            if (e == 0) {
+                s = (int) std::lround(std::sqrt((double) rows));
+                GGML_ASSERT(s * s == rows && "granite4 tile is not square");
+            } else {
+                GGML_ASSERT(rows == s * s && "granite4 tiles have inconsistent size");
+            }
+        }
+
+        std::vector<float> newline_row;
+        clip_granite4_newline_row(ctx_clip, newline_row);
+        GGML_ASSERT((int) newline_row.size() == n_embd_out);
+
+        granite4_reassemble(
+            enc, s,
+            (int) image_tokens->g4v_grid_y, (int) image_tokens->g4v_grid_x,
+            (int) image_tokens->g4v_orig_h, (int) image_tokens->g4v_orig_w,
+            newline_row, n_embd_out, out_embd);
+
+        GGML_ASSERT((int) (out_embd.size() / n_embd_out) == (int) image_tokens->n_tokens());
+
+        return 0;
     }
 
     bool ok = clip_image_batch_encode(
