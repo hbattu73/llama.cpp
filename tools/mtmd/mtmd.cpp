@@ -671,8 +671,7 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_GRANITE4_VISION:
                 {
-                    img_beg = "<image>";
-                    img_end = "";
+                    img_end = "\n";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_granite>(ctx_v);
                     ov_img_first = true;
                 } break;
